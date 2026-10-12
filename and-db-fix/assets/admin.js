@@ -150,13 +150,13 @@
 
 	function tabOverview() {
 		var d = state.data;
-		var owners = {};
-		d.tables.forEach(function (t) { owners[t.owner] = (owners[t.owner] || 0) + t.total; });
+		var owners = {}, orph = {};
+		d.tables.forEach(function (t) { owners[t.owner] = (owners[t.owner] || 0) + t.total; if (t.orphan) { orph[t.owner] = true; } });
 		var list = Object.keys(owners).map(function (k) { return [k, owners[k]]; }).sort(function (a, b) { return b[1] - a[1]; }).slice(0, 12);
 		var max = list.length ? list[0][1] : 1;
 		var ownerRows = list.map(function (o) {
 			var pct = d.total ? (o[1] / d.total * 100) : 0;
-			return '<tr><td>' + esc(o[0]) + '</td><td class="num">' + fmtBytes(o[1]) + '</td><td class="num">' + nf.format(pct) + '%</td>' +
+			return '<tr class="' + (orph[o[0]] ? 'orphan' : '') + '"><td>' + esc(o[0]) + (orph[o[0]] ? ' <span class="ad-badge">nincs telepítve</span>' : '') + '</td><td class="num">' + fmtBytes(o[1]) + '</td><td class="num">' + nf.format(pct) + '%</td>' +
 				'<td style="width:35%"><span class="ad-minibar" style="width:' + Math.max(2, o[1] / max * 100) + '%"></span></td></tr>';
 		}).join('');
 
@@ -170,7 +170,8 @@
 				return '<option value="' + g[0] + '"' + (state.group === g[0] ? ' selected' : '') + '>' + g[1] + '</option>';
 			}).join('') + '</select></label>' +
 			'<input type="search" placeholder="Szűrés névre / forrásra…" value="' + esc(state.filter) + '" data-input="filter">' +
-			'<span class="ad-mut">' + d.tables.length + ' tábla</span></div>' +
+			'<span class="ad-mut">' + d.tables.length + ' tábla</span>' +
+			'<span class="ad-legend"><i class="ad-sw-blue"></i> kék sor: olyan pluginhoz tartozó tábla, ami már nincs telepítve</span></div>' +
 			progressBox('ad-p-drop') +
 			'<div class="ad-scroll" id="ad-tablewrap"></div>' +
 			'<p class="ad-mut">A „Tábla törlése” csak a WordPress maghoz nem tartozó, azonos előtagú táblákon jelenik meg. Olyan plugin táblájára használd, ami már nincs telepítve, és előtte készíts mentést.</p></div>';
@@ -185,9 +186,12 @@
 		});
 	}
 
+	var rowNo = 0;
 	function tableRow(t, total) {
 		var hot = total && t.total / total > 0.25;
-		return '<tr' + (hot ? ' class="hot"' : '') + '><td><code>' + esc(t.name) + '</code></td><td>' + esc(t.owner) + '</td><td>' + esc(t.engine) + '</td>' +
+		var cls = ((rowNo++ % 2) ? 'z ' : '') + (hot ? 'hot ' : '') + (t.orphan ? 'orphan' : '');
+		return '<tr class="' + cls.trim() + '"><td><code>' + esc(t.name) + '</code></td><td>' + esc(t.owner) +
+			(t.orphan ? ' <span class="ad-badge">nincs telepítve</span>' : '') + '</td><td>' + esc(t.engine) + '</td>' +
 			'<td class="num">' + fmtNum(t.rows) + '</td><td class="num">' + fmtBytes(t.data) + '</td><td class="num">' + fmtBytes(t.index) + '</td>' +
 			'<td class="num"><strong>' + fmtBytes(t.total) + '</strong></td><td class="num">' + fmtBytes(t.free) + '</td><td>' +
 			(t.drop ? '<button type="button" class="button button-small button-link-delete" data-act="drop" data-table="' + esc(t.name) + '">Tábla törlése</button>' : '') +
@@ -206,6 +210,7 @@
 			return '<th class="sortable' + (c[2] ? ' num' : '') + '" data-act="sort" data-key="' + c[0] + '">' + c[1] + arrow + '</th>';
 		}).join('') + '<th></th></tr>';
 		var out = '';
+		rowNo = 0;
 		if (state.group === 'none') {
 			out = sortedRows(rows).map(function (t) { return tableRow(t, d.total); }).join('');
 		} else {
@@ -369,6 +374,7 @@
 			'<p>Címzettek (vesszővel vagy új sorral elválasztva):</p>' +
 			'<textarea class="ad-em" id="st-emails" placeholder="nev@pelda.hu, masik@pelda.hu">' + esc(s.emails) + '</textarea>' +
 			sw('st-mail_monthly', s.mail_monthly, '<strong>Havi jelentés</strong> minden hónap első napján', 'A limit kihasználtsága és hogy az előző hónapban melyik plugin/szolgáltatás mennyivel növelte az adatbázist (a napi mérések alapján; az első teljes hónapos adat a bekapcsolás utáni hónapban lesz).') +
+			sw('st-mail_weekly', s.mail_weekly, '<strong>Heti optimalizálási jelentés</strong>', 'Minden lefutott heti automatikus takarítás után email az eredménnyel (törölt elemek, méret előtte/utána). Csak akkor működik, ha a heti takarítás be van kapcsolva.') +
 			sw('st-mail_70', s.mail_70, 'Figyelmeztetés 70% fölött', 'Egyszer küld, amikor az adatbázis átlépi a 70%-ot.') +
 			sw('st-mail_80', s.mail_80, 'Figyelmeztetés 80% fölött', 'Egyszer küld, amikor az adatbázis átlépi a 80%-ot.') +
 			sw('st-mail_95', s.mail_95, 'Ismétlődő figyelmeztetés 95% fölött', 'Amíg 95% felett van, újra és újra küld.') +
@@ -385,7 +391,7 @@
 		(state.tasks || []).forEach(function (t) { var e = g('st-task-' + t.id); if (e && e.checked) { tasks.push(t.id); } });
 		var payload = {
 			limit_mb: g('st-limit').value, enabled: g('st-enabled').checked, optimize: g('st-optimize').checked, tasks: tasks,
-			emails: g('st-emails').value, mail_monthly: g('st-mail_monthly').checked, mail_70: g('st-mail_70').checked,
+			emails: g('st-emails').value, mail_monthly: g('st-mail_monthly').checked, mail_weekly: g('st-mail_weekly').checked, mail_70: g('st-mail_70').checked,
 			mail_80: g('st-mail_80').checked, mail_95: g('st-mail_95').checked, mail_95_hours: g('st-hours').value
 		};
 		setBusy(btn, true, 'Mentés…');
@@ -432,6 +438,17 @@
 				.then(function () { setBusy(el, false); });
 		}
 	});
+
+	function rowHover(ev, on) {
+		var b = ev.target.closest && ev.target.closest('[data-act="drop"], [data-act="noauto"]');
+		if (!b) { return; }
+		var tr = b.closest('tr');
+		if (tr) { tr.classList.toggle('sel-row', on); }
+	}
+	root.addEventListener('mouseover', function (ev) { rowHover(ev, true); });
+	root.addEventListener('mouseout', function (ev) { rowHover(ev, false); });
+	root.addEventListener('focusin', function (ev) { rowHover(ev, true); });
+	root.addEventListener('focusout', function (ev) { rowHover(ev, false); });
 
 	root.addEventListener('change', function (ev) {
 		var el = ev.target, what = el.getAttribute('data-change');

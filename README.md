@@ -1,4 +1,4 @@
-# And DB fix (WordPress plugin) – v1.2
+# And DB fix (WordPress plugin) – v1.3
 
 Fejlesztő: galandras12, Claude Code · https://github.com/galandras12/and_fix_db
 
@@ -28,3 +28,8 @@ Megmutatja, mi foglalja az adatbázist, és törli a felesleget.
 - Kapcsolók (csúszkák) a heti automatikus takarításhoz.
 - Állítható adatbázis-limit (alap 100 MB, 0 = nincs limit); színes fejléc és admin sáv: zöld <70%, citromsárga 70–80%, narancs 80–95%, piros ≥95% figyelmeztetéssel.
 - Email: havi jelentés (limit kihasználtság + forrásonkénti havi növekedés a napi mérésekből), 70% / 80% figyelmeztetés, 95% felett ismétlődő figyelmeztetés beállítható időközzel, teszt email.
+
+## 1.3
+- Heti optimalizálási jelentés email (a heti automatikus takarítás után, kapcsolóval).
+- Kék sor + „nincs telepítve” jelzés azoknak a tábláknak, amelyek egy már nem telepített (ismert) pluginhoz tartoznak.
+- Csíkozott sorok, hover, és a törlés gombra állva a teljes sor sötétszürke kerettel kiemelődik.

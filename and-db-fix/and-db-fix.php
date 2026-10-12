@@ -3,7 +3,7 @@
  * Plugin Name: And DB fix
  * Plugin URI: https://github.com/galandras12/and_fix_db
  * Description: Megmutatja, mi foglalja az adatbázis tárhelyét (táblák, autoload opciók, pluginok), felesleges adatokat detektál és törli, táblákat optimalizál, opcionálisan hetente automatikusan takarít.
- * Version: 1.2
+ * Version: 1.3
  * Author: galandras12, Claude Code
  * Author URI: https://github.com/galandras12/and_fix_db
  * Requires at least: 5.0
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class ADBOPT {
 
-	const VER       = '1.2';
+	const VER       = '1.3';
 	const CAP       = 'manage_options';
 	const OPT       = 'adbopt_settings';
 	const SNAP      = 'adbopt_snapshots';
@@ -453,6 +453,91 @@ final class ADBOPT {
 		return ( $pos > 1 ) ? 'Valószínűleg: "' . substr( $name, 0, $pos ) . '" plugin/téma' : 'Ismeretlen';
 	}
 
+	/** Plugin-forrás → a telepítéskor használt mappanevek. Ami nincs itt, azt sosem jelöljük "nem telepítettnek". */
+	private static function owner_slugs() {
+		return array(
+			'WooCommerce'                   => array( 'woocommerce' ),
+			'Yoast SEO'                     => array( 'wordpress-seo', 'wordpress-seo-premium' ),
+			'Rank Math SEO'                 => array( 'seo-by-rank-math', 'seo-by-rank-math-pro' ),
+			'All in One SEO'                => array( 'all-in-one-seo-pack', 'all-in-one-seo-pack-pro' ),
+			'WPML'                          => array( 'sitepress-multilingual-cms' ),
+			'Redirection'                   => array( 'redirection' ),
+			'Wordfence'                     => array( 'wordfence' ),
+			'iThemes / Solid Security'      => array( 'better-wp-security', 'solid-security', 'ithemes-security-pro' ),
+			'All In One WP Security'        => array( 'all-in-one-wp-security-and-firewall' ),
+			'WPForms'                       => array( 'wpforms-lite', 'wpforms' ),
+			'Formidable Forms'              => array( 'formidable' ),
+			'Gravity Forms'                 => array( 'gravityforms' ),
+			'Elementor'                     => array( 'elementor', 'elementor-pro' ),
+			'WP Statistics'                 => array( 'wp-statistics' ),
+			'SlimStat'                      => array( 'wp-slimstat' ),
+			'WP Mail SMTP'                  => array( 'wp-mail-smtp', 'wp-mail-smtp-pro' ),
+			'LiteSpeed Cache'               => array( 'litespeed-cache' ),
+			'Relevanssi'                    => array( 'relevanssi', 'relevanssi-premium' ),
+			'Slider Revolution'             => array( 'revslider' ),
+			'Divi / Elegant Themes'         => array( 'divi-builder', 'divi', 'extra' ),
+			'CookieYes'                     => array( 'cookie-law-info' ),
+			'NextGEN Gallery'               => array( 'nextgen-gallery' ),
+			'Smush'                         => array( 'wp-smushit', 'wp-smush-pro' ),
+			'EWWW Image Optimizer'          => array( 'ewww-image-optimizer' ),
+			'Photo Gallery (10Web)'         => array( 'photo-gallery' ),
+			'Duplicator'                    => array( 'duplicator', 'duplicator-pro' ),
+			'LearnPress'                    => array( 'learnpress' ),
+			'MailPoet'                      => array( 'mailpoet' ),
+			'Newsletter'                    => array( 'newsletter' ),
+			'WP Activity Log'               => array( 'wp-security-audit-log' ),
+			'Simple History'                => array( 'simple-history' ),
+			'Ultimate Member'               => array( 'ultimate-member' ),
+			'BuddyPress'                    => array( 'buddypress' ),
+			'Contact Form CFDB7'            => array( 'contact-form-cfdb7' ),
+			'Jetpack'                       => array( 'jetpack' ),
+			'ProfilePress'                  => array( 'wp-user-avatar', 'wp-user-avatar-pro' ),
+			'Fluent Forms'                  => array( 'fluentform', 'fluentformpro' ),
+			'Ninja Forms'                   => array( 'ninja-forms' ),
+			'TablePress'                    => array( 'tablepress' ),
+			'WP Rocket / Royal Addons'      => array( 'wp-rocket', 'royal-elementor-addons' ),
+			'WP Google Maps'                => array( 'wp-google-maps' ),
+			'WordPress Download Manager'    => array( 'download-manager' ),
+			'File Manager'                  => array( 'wp-file-manager' ),
+		);
+	}
+
+	/** Telepített pluginok / témák / mu-pluginok mappanevei (kisbetűvel). */
+	private static function installed_slugs() {
+		static $cache = null;
+		if ( null !== $cache ) {
+			return $cache;
+		}
+		$dirs = array( WP_PLUGIN_DIR, get_theme_root(), defined( 'WPMU_PLUGIN_DIR' ) ? WPMU_PLUGIN_DIR : '' );
+		$out  = array();
+		foreach ( $dirs as $d ) {
+			if ( $d && is_dir( $d ) ) {
+				foreach ( (array) scandir( $d ) as $f ) {
+					if ( '.' !== $f && '..' !== $f ) {
+						$out[ strtolower( preg_replace( '/\.php$/i', '', $f ) ) ] = true;
+					}
+				}
+			}
+		}
+		$cache = $out;
+		return $cache;
+	}
+
+	/** Igaz, ha a tábla egy ismert, de már nem telepített pluginhoz tartozik. */
+	public static function is_orphan_owner( $owner ) {
+		$map = self::owner_slugs();
+		if ( ! isset( $map[ $owner ] ) ) {
+			return false;
+		}
+		$installed = self::installed_slugs();
+		foreach ( $map[ $owner ] as $slug ) {
+			if ( isset( $installed[ strtolower( $slug ) ] ) ) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	public static function autoload_values() {
 		if ( function_exists( 'wp_autoload_values_to_autoload' ) ) {
 			return wp_autoload_values_to_autoload();
@@ -710,6 +795,7 @@ final class ADBOPT {
 				'total'  => $sum,
 				'free'   => (int) $t->free_len,
 				'drop'   => self::can_drop( $t->name ),
+				'orphan' => self::is_orphan_owner( self::table_owner( $t->name ) ),
 			);
 		}
 		set_transient( 'adbopt_size', $total, 10 * MINUTE_IN_SECONDS );
@@ -781,6 +867,7 @@ final class ADBOPT {
 				'limit_mb'      => 100,
 				'emails'        => '',
 				'mail_monthly'  => 0,
+				'mail_weekly'   => 0,
 				'mail_70'       => 0,
 				'mail_80'       => 0,
 				'mail_95'       => 0,
@@ -816,6 +903,7 @@ final class ADBOPT {
 		$s['tasks']         = array_values( array_intersect( $chosen, $safe ) );
 		$s['emails']        = implode( ', ', self::parse_emails( isset( $p['emails'] ) ? $p['emails'] : '' ) );
 		$s['mail_monthly']  = empty( $p['mail_monthly'] ) ? 0 : 1;
+		$s['mail_weekly']   = empty( $p['mail_weekly'] ) ? 0 : 1;
 		$s['mail_70']       = empty( $p['mail_70'] ) ? 0 : 1;
 		$s['mail_80']       = empty( $p['mail_80'] ) ? 0 : 1;
 		$s['mail_95']       = empty( $p['mail_95'] ) ? 0 : 1;
@@ -843,7 +931,8 @@ final class ADBOPT {
 			return;
 		}
 		@set_time_limit( 300 ); // phpcs:ignore
-		$out = self::run_selected( $s['tasks'], 120 );
+		$before = self::db_size();
+		$out    = self::run_selected( $s['tasks'], 120 );
 		if ( $s['optimize'] ) {
 			$n = 0;
 			global $wpdb;
@@ -860,6 +949,20 @@ final class ADBOPT {
 		$s['last_run']    = time();
 		$s['last_result'] = wp_strip_all_tags( implode( '; ', $out ) );
 		update_option( self::OPT, $s, false );
+
+		$to = self::parse_emails( $s['emails'] );
+		if ( $s['mail_weekly'] && $to ) {
+			$after = self::db_size();
+			$st    = self::status( $after, $s['limit_mb'] );
+			$body  = '<p>Lefutott a heti automatikus adatbázis-takarítás.</p>' . self::status_html( $after, $st );
+			$body .= '<p>Méret a futás előtt: <strong>' . esc_html( size_format( $before, 2 ) ) . '</strong>, utána: <strong>' . esc_html( size_format( $after, 2 ) ) . '</strong> (' . esc_html( ( $after <= $before ? '-' : '+' ) . size_format( abs( $before - $after ), 2 ) ) . ').</p>';
+			$body .= '<ul>';
+			foreach ( $out as $line ) {
+				$body .= '<li>' . esc_html( $line ) . '</li>';
+			}
+			$body .= '</ul>';
+			self::send_mail( $to, 'Heti optimalizálási jelentés', self::mail_wrap( 'Heti optimalizálási jelentés', $body ) );
+		}
 	}
 
 	public static function run_hourly() {
