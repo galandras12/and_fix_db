@@ -1,12 +1,15 @@
 <?php
 /**
- * Plugin Name: Adatbázis Optimalizáló
+ * Plugin Name: And DB fix
+ * Plugin URI: https://github.com/galandras12/and_fix_db
  * Description: Megmutatja, mi foglalja az adatbázis tárhelyét (táblák, autoload opciók, pluginok), felesleges adatokat detektál és törli, táblákat optimalizál, opcionálisan hetente automatikusan takarít.
- * Version: 1.0.0
+ * Version: 1.0
+ * Author: galandras12, Claude Code
+ * Author URI: https://github.com/galandras12/and_fix_db
  * Requires at least: 5.0
  * Requires PHP: 7.2
  * License: GPL-2.0-or-later
- * Text Domain: adatbazis-optimalizalo
+ * Text Domain: and-db-fix
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -18,7 +21,7 @@ final class ADBOPT {
 	const CAP       = 'manage_options';
 	const OPT       = 'adbopt_settings';
 	const CRON_HOOK = 'adbopt_cron';
-	const SLUG      = 'adatbazis-optimalizalo';
+	const SLUG      = 'and-db-fix';
 
 	public static function init() {
 		add_action( 'admin_menu', array( __CLASS__, 'menu' ) );
@@ -458,7 +461,7 @@ final class ADBOPT {
 	/* ------------------------------------------------------------------ */
 
 	public static function menu() {
-		add_management_page( 'Adatbázis Optimalizáló', 'Adatbázis Optimalizáló', self::CAP, self::SLUG, array( __CLASS__, 'page' ) );
+		add_management_page( 'And DB fix', 'And DB fix', self::CAP, self::SLUG, array( __CLASS__, 'page' ) );
 	}
 
 	private static function post_form_open( $action ) {
@@ -473,7 +476,7 @@ final class ADBOPT {
 		}
 		global $wpdb;
 
-		echo '<div class="wrap"><h1>Adatbázis Optimalizáló</h1>';
+		echo '<div class="wrap"><h1>And DB fix</h1>';
 		self::show_notice();
 
 		$tables   = self::table_stats();

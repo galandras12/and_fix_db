@@ -1,10 +1,12 @@
-# Adatbázis Optimalizáló (WordPress plugin)
+# And DB fix (WordPress plugin) – v1.0
+
+Fejlesztő: galandras12, Claude Code · https://github.com/galandras12/and_fix_db
 
 Megmutatja, mi foglalja az adatbázist, és törli a felesleget.
 
 ## Telepítés
-1. Az `adatbazis-optimalizalo.zip` feltöltése: WP admin → Bővítmények → Új hozzáadása → Bővítmény feltöltése.
-2. Aktiválás után: **Eszközök → Adatbázis Optimalizáló**.
+1. Az `and-db-fix.zip` feltöltése: WP admin → Bővítmények → Új hozzáadása → Bővítmény feltöltése.
+2. Aktiválás után: **Eszközök → And DB fix**.
 
 ## Mit tud
 - Teljes DB-méret és a táblák listája méret szerint, a táblák **forrásának** (melyik plugin) becslésével, plugin szerinti összesítéssel.
