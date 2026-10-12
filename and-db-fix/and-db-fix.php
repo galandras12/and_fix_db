@@ -3,7 +3,7 @@
  * Plugin Name: And DB fix
  * Plugin URI: https://github.com/galandras12/and_fix_db
  * Description: Megmutatja, mi foglalja az adatbázis tárhelyét (táblák, autoload opciók, pluginok), felesleges adatokat detektál és törli, táblákat optimalizál, opcionálisan hetente automatikusan takarít.
- * Version: 1.1
+ * Version: 1.2
  * Author: galandras12, Claude Code
  * Author URI: https://github.com/galandras12/and_fix_db
  * Requires at least: 5.0
@@ -16,26 +16,35 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+
 final class ADBOPT {
 
+	const VER       = '1.2';
 	const CAP       = 'manage_options';
 	const OPT       = 'adbopt_settings';
+	const SNAP      = 'adbopt_snapshots';
 	const CRON_HOOK = 'adbopt_cron';
+	const HOURLY    = 'adbopt_hourly';
 	const SLUG      = 'and-db-fix';
 
 	public static function init() {
 		add_action( 'admin_menu', array( __CLASS__, 'menu' ) );
-		add_action( 'admin_post_adbopt_clean', array( __CLASS__, 'handle_clean' ) );
-		add_action( 'admin_post_adbopt_optimize', array( __CLASS__, 'handle_optimize' ) );
-		add_action( 'admin_post_adbopt_settings', array( __CLASS__, 'handle_settings' ) );
+		add_action( 'admin_enqueue_scripts', array( __CLASS__, 'assets' ) );
 		add_action( 'admin_post_adbopt_backup', array( __CLASS__, 'handle_backup' ) );
-		add_action( 'admin_post_adbopt_droptable', array( __CLASS__, 'handle_droptable' ) );
-		add_action( 'admin_post_adbopt_noautoload', array( __CLASS__, 'handle_noautoload' ) );
+		add_action( 'wp_ajax_adbopt', array( __CLASS__, 'ajax' ) );
+		add_action( 'admin_bar_menu', array( __CLASS__, 'admin_bar' ), 100 );
 		add_action( self::CRON_HOOK, array( __CLASS__, 'run_cron' ) );
+		add_action( self::HOURLY, array( __CLASS__, 'run_hourly' ) );
+		add_action( 'init', function () {
+			if ( ! wp_next_scheduled( ADBOPT::HOURLY ) ) {
+				wp_schedule_event( time() + 300, 'hourly', ADBOPT::HOURLY );
+			}
+		} );
 	}
 
 	public static function deactivate() {
 		wp_clear_scheduled_hook( self::CRON_HOOK );
+		wp_clear_scheduled_hook( self::HOURLY );
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -458,200 +467,285 @@ final class ADBOPT {
 		return $wpdb->prepare( $ph, $vals ); // phpcs:ignore WordPress.DB.PreparedSQL
 	}
 
+
 	/* ------------------------------------------------------------------ */
-	/* Admin oldal                                                         */
+	/* Méret, limit, státusz                                               */
+	/* ------------------------------------------------------------------ */
+
+	public static function db_size() {
+		global $wpdb;
+		return (int) $wpdb->get_var( $wpdb->prepare( 'SELECT SUM(DATA_LENGTH + INDEX_LENGTH) FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s', DB_NAME ) );
+	}
+
+	public static function cached_size() {
+		$v = get_transient( 'adbopt_size' );
+		if ( false === $v ) {
+			$v = self::db_size();
+			set_transient( 'adbopt_size', $v, 10 * MINUTE_IN_SECONDS );
+		}
+		return (int) $v;
+	}
+
+	/**
+	 * level: 0 zöld (<70%), 1 citromsárga (70-80%), 2 narancs (80-95%), 3 piros (95%+); -1 nincs limit.
+	 */
+	public static function status( $size, $limit_mb ) {
+		$limit_mb = (int) $limit_mb;
+		if ( $limit_mb <= 0 ) {
+			return array( 'level' => -1, 'pct' => null, 'limit' => 0, 'message' => 'Nincs beállított limit.' );
+		}
+		$limit = $limit_mb * 1048576;
+		$pct   = $size / $limit * 100;
+		if ( $pct >= 95 ) {
+			$level = 3;
+			$msg   = 'FIGYELEM! Az adatbázis elérte vagy meghaladta a limit 95%-át. Azonnal tisztítsd az adatbázist, különben a tárhely leállíthatja az oldalt!';
+		} elseif ( $pct >= 80 ) {
+			$level = 2;
+			$msg   = 'Az adatbázis a limit 80–95%-án áll. Érdemes takarítani.';
+		} elseif ( $pct >= 70 ) {
+			$level = 1;
+			$msg   = 'Az adatbázis a limit 70–80%-án áll.';
+		} else {
+			$level = 0;
+			$msg   = 'Az adatbázis mérete rendben van.';
+		}
+		return array( 'level' => $level, 'pct' => round( $pct, 1 ), 'limit' => $limit, 'message' => $msg );
+	}
+
+	public static function level_colors( $level ) {
+		$c = array(
+			-1 => array( '#6b7280', '#fff' ),
+			0  => array( '#2e9e4f', '#fff' ),
+			1  => array( '#f2d600', '#1d2327' ),
+			2  => array( '#f08a00', '#fff' ),
+			3  => array( '#d63638', '#fff' ),
+		);
+		return $c[ $level ];
+	}
+
+	public static function admin_bar( $bar ) {
+		if ( ! is_admin() || ! current_user_can( self::CAP ) ) {
+			return;
+		}
+		$s    = self::settings();
+		$size = self::cached_size();
+		$st   = self::status( $size, $s['limit_mb'] );
+		list( $bg, $fg ) = self::level_colors( $st['level'] );
+		$txt = 'DB ' . size_format( $size, 1 ) . ( $st['limit'] ? ' / ' . $s['limit_mb'] . ' MB (' . $st['pct'] . '%)' : '' );
+		$bar->add_node( array(
+			'id'    => 'adbopt',
+			'title' => '<span style="background:' . esc_attr( $bg ) . ';color:' . esc_attr( $fg ) . ';padding:2px 8px;border-radius:3px;font-weight:600">' . esc_html( $txt ) . '</span>',
+			'href'  => admin_url( 'tools.php?page=' . self::SLUG ),
+		) );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Admin oldal + AJAX                                                  */
 	/* ------------------------------------------------------------------ */
 
 	public static function menu() {
 		add_management_page( 'And DB fix', 'And DB fix', self::CAP, self::SLUG, array( __CLASS__, 'page' ) );
 	}
 
-	private static function post_form_open( $action ) {
-		echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
-		echo '<input type="hidden" name="action" value="' . esc_attr( $action ) . '">';
-		wp_nonce_field( $action );
+	public static function assets( $hook ) {
+		if ( 'tools_page_' . self::SLUG !== $hook ) {
+			return;
+		}
+		$url = plugin_dir_url( __FILE__ );
+		wp_enqueue_style( 'adbopt', $url . 'assets/admin.css', array(), self::VER );
+		wp_enqueue_script( 'adbopt', $url . 'assets/admin.js', array(), self::VER, true );
+		wp_localize_script( 'adbopt', 'ADBOPT_CFG', array(
+			'ajax'        => admin_url( 'admin-ajax.php' ),
+			'nonce'       => wp_create_nonce( 'adbopt' ),
+			'backupUrl'   => admin_url( 'admin-post.php' ),
+			'backupNonce' => wp_create_nonce( 'adbopt_backup' ),
+			'version'     => self::VER,
+			'siteName'    => get_bloginfo( 'name' ),
+		) );
 	}
 
 	public static function page() {
 		if ( ! current_user_can( self::CAP ) ) {
 			wp_die( 'Nincs jogosultságod.' );
 		}
-		global $wpdb;
-
-		echo '<div class="wrap"><h1>And DB fix</h1>';
-		self::show_notice();
-
-		$tables   = self::table_stats();
-		$total    = 0;
-		$total_ov = 0;
-		foreach ( $tables as $t ) {
-			$total    += $t->data_len + $t->index_len;
-			$total_ov += (int) $t->free_len;
-		}
-
-		echo '<div class="notice notice-info inline"><p><strong>Teljes adatbázisméret (' . esc_html( DB_NAME ) . '): ' . esc_html( size_format( $total, 2 ) ) . '</strong>';
-		echo ' &ndash; ebből felszabadítható töredezettség (overhead): ' . esc_html( size_format( $total_ov, 2 ) ) . '.<br>';
-		echo 'A tárhelyszolgáltató az adatbázis <em>összes</em> táblájának méretét számolja, a más előtaggal rendelkező (pl. másik WP-telepítés vagy törölt plugin maradék) táblákat is.</p></div>';
-
-		/* 0. Mentés */
-		echo '<h2>Biztonsági mentés</h2>';
-		echo '<p>Egy kattintással letölthető SQL-mentés az adatbázis <code>' . esc_html( $wpdb->prefix ) . '</code> előtagú tábláiról. A fájlnév az oldal címét és a dátum-időt tartalmazza. Visszatöltés: phpMyAdmin → Importálás (a .sql.gz fájlt is kicsomagolás nélkül elfogadja). <strong>Törlés előtt érdemes lementeni.</strong></p>';
-		self::post_form_open( 'adbopt_backup' );
-		echo '<button class="button button-primary" name="gz" value="0">Mentés letöltése (.sql)</button> ';
-		if ( function_exists( 'deflate_init' ) ) {
-			echo '<button class="button" name="gz" value="1">Tömörített mentés (.sql.gz, kisebb)</button>';
-		}
-		echo '</form>';
-
-		/* 1. Táblák */
-		echo '<h2>1. Táblák mérete (legnagyobb elöl)</h2>';
-		echo '<p>A sorszám becsült érték (InnoDB). A "Forrás" oszlop a tábla nevéből következtet arra, melyik plugin vagy WordPress-rész hozta létre.</p>';
-		echo '<table class="widefat striped"><thead><tr><th>Tábla</th><th>Forrás</th><th>Sorok (~)</th><th>Adat</th><th>Index</th><th>Összesen</th><th>Overhead</th><th></th></tr></thead><tbody>';
-		$shown = 0;
-		foreach ( $tables as $t ) {
-			if ( $shown++ >= 40 ) {
-				break;
-			}
-			$sum   = $t->data_len + $t->index_len;
-			$style = ( $total > 0 && $sum / $total > 0.25 ) ? ' style="background:#fff3cd"' : '';
-			echo '<tr' . $style . '><td><code>' . esc_html( $t->name ) . '</code></td><td>' . esc_html( self::table_owner( $t->name ) ) . '</td>';
-			echo '<td>' . esc_html( number_format_i18n( (int) $t->row_count ) ) . '</td>';
-			echo '<td>' . esc_html( size_format( $t->data_len, 2 ) ) . '</td><td>' . esc_html( size_format( $t->index_len, 2 ) ) . '</td>';
-			echo '<td><strong>' . esc_html( size_format( $sum, 2 ) ) . '</strong></td><td>' . esc_html( size_format( (int) $t->free_len, 2 ) ) . '</td><td>';
-			if ( self::can_drop( $t->name ) ) {
-				self::post_form_open( 'adbopt_droptable' );
-				echo '<input type="hidden" name="table" value="' . esc_attr( $t->name ) . '">';
-				echo '<button class="button button-small" onclick="return confirm(\'VÉGLEGESEN törlöd a(z) ' . esc_js( $t->name ) . ' táblát? Csak akkor tedd, ha a hozzá tartozó plugin már nincs telepítve, és van mentésed!\')">Tábla törlése</button></form>';
-			}
-			echo '</td></tr>';
-		}
-		echo '</tbody></table>';
-		echo '<p class="description">A "Tábla törlése" gomb csak a WordPress maghoz nem tartozó, ehhez a telepítéshez tartozó (azonos előtagú) táblákon jelenik meg. Olyan plugin táblájára használd, amely már nincs telepítve (pl. kitörölt Wordfence: <code>wfconfig</code>, <code>wfhits</code>, <code>wfknownfilelist</code> stb.).</p>';
-		if ( count( $tables ) > 40 ) {
-			echo '<p>(Csak a 40 legnagyobb tábla látszik; összesen ' . (int) count( $tables ) . ' van.)</p>';
-		}
-
-		/* Plugin szerinti összesítés */
-		$by_owner = array();
-		foreach ( $tables as $t ) {
-			$o = self::table_owner( $t->name );
-			if ( ! isset( $by_owner[ $o ] ) ) {
-				$by_owner[ $o ] = 0;
-			}
-			$by_owner[ $o ] += $t->data_len + $t->index_len;
-		}
-		arsort( $by_owner );
-		echo '<h2>2. Méret plugin / forrás szerint</h2><table class="widefat striped" style="max-width:700px"><thead><tr><th>Forrás</th><th>Tábla-méret</th><th>Arány</th></tr></thead><tbody>';
-		foreach ( array_slice( $by_owner, 0, 15, true ) as $o => $sz ) {
-			echo '<tr><td>' . esc_html( $o ) . '</td><td>' . esc_html( size_format( $sz, 2 ) ) . '</td><td>' . esc_html( $total ? round( 100 * $sz / $total, 1 ) : 0 ) . '%</td></tr>';
-		}
-		echo '</tbody></table>';
-
-		/* 3. Autoload */
-		$in  = self::autoload_sql_list();
-		$row = $wpdb->get_row( "SELECT COUNT(*) AS c, SUM(LENGTH(option_value)) AS s FROM {$wpdb->options} WHERE autoload IN ({$in})" ); // phpcs:ignore WordPress.DB.PreparedSQL
-		echo '<h2>3. Legnagyobb opciók (wp_options)</h2>';
-		echo '<p>Autoload opciók: <strong>' . esc_html( number_format_i18n( (int) $row->c ) ) . ' db, ' . esc_html( size_format( (int) $row->s, 2 ) ) . '</strong>. ';
-		echo 'Ha ez 1&ndash;2 MB fölött van, minden oldalbetöltést lassít.</p>';
-		$opts = $wpdb->get_results( "SELECT option_name, autoload, LENGTH(option_value) AS len FROM {$wpdb->options} ORDER BY len DESC LIMIT 25" ); // phpcs:ignore WordPress.DB.PreparedSQL
-		$core_protected = array( 'siteurl', 'home', 'blogname', 'active_plugins', 'template', 'stylesheet', 'rewrite_rules', 'cron', 'permalink_structure', 'users_can_register', 'default_role', 'WPLANG' );
-		echo '<table class="widefat striped"><thead><tr><th>Opció neve</th><th>Valószínű forrás</th><th>Méret</th><th>Autoload</th><th></th></tr></thead><tbody>';
-		foreach ( $opts as $o ) {
-			$is_auto = in_array( $o->autoload, self::autoload_values(), true );
-			echo '<tr><td><code>' . esc_html( mb_strimwidth( $o->option_name, 0, 70, '…' ) ) . '</code></td><td>' . esc_html( self::option_owner( $o->option_name ) ) . '</td>';
-			echo '<td><strong>' . esc_html( size_format( (int) $o->len, 2 ) ) . '</strong></td><td>' . ( $is_auto ? 'igen' : 'nem' ) . '</td><td>';
-			if ( $is_auto && ! in_array( $o->option_name, $core_protected, true ) ) {
-				self::post_form_open( 'adbopt_noautoload' );
-				echo '<input type="hidden" name="option" value="' . esc_attr( $o->option_name ) . '">';
-				echo '<button class="button button-small" onclick="return confirm(\'Kikapcsolod az autoload-ot ennél az opciónál? Az opció megmarad, csak nem töltődik be minden oldalnál.\')">Autoload ki</button></form>';
-			}
-			echo '</td></tr>';
-		}
-		echo '</tbody></table>';
-
-		/* 4. Takarítás */
-		echo '<h2>4. Felesleges adatok törlése</h2>';
-		echo '<p><strong>Törlés előtt készíts adatbázis-mentést</strong> (pl. UpdraftPlus vagy a tárhely phpMyAdmin exportja). A törlés nem visszavonható.</p>';
-		self::post_form_open( 'adbopt_clean' );
-		echo '<table class="widefat striped"><thead><tr><th style="width:30px"></th><th>Mit</th><th>Találat</th><th>Leírás</th></tr></thead><tbody>';
-		foreach ( self::tasks() as $id => $t ) {
-			$count = self::task_count( $t );
-			echo '<tr><td><input type="checkbox" name="tasks[]" value="' . esc_attr( $id ) . '"' . ( ( $count > 0 && $t['safe'] ) ? ' checked' : '' ) . '></td>';
-			echo '<td><strong>' . esc_html( $t['label'] ) . '</strong></td><td>' . esc_html( number_format_i18n( $count ) ) . ' db</td><td>' . esc_html( $t['desc'] ) . '</td></tr>';
-		}
-		echo '</tbody></table><p><button class="button button-primary" onclick="return confirm(\'Biztosan törlöd a kijelölt elemeket? Van mentésed?\')">Kijelöltek törlése</button></p></form>';
-		echo '<p class="description">Az előre bejelölt elemek biztonságosnak számítanak. A revíziók, a kuka és az összes tranziens törlése tudatos döntés, ezeket magadnak jelöld be.</p>';
-
-		/* 5. Optimalizálás */
-		echo '<h2>5. Táblák optimalizálása (OPTIMIZE TABLE)</h2>';
-		echo '<p>Törlés után ez adja vissza ténylegesen a helyet a lemeznek (InnoDB-nél a tábla újraépül). Nagy táblánál eltarthat egy ideig.</p>';
-		self::post_form_open( 'adbopt_optimize' );
-		echo '<p><button class="button" name="scope" value="overhead">Csak a töredezett táblák</button> ';
-		echo '<button class="button" name="scope" value="all">Minden tábla</button></p></form>';
-
-		/* 6. Automatikus */
-		$s = self::settings();
-		echo '<h2>6. Automatikus heti takarítás</h2>';
-		self::post_form_open( 'adbopt_settings' );
-		echo '<p><label><input type="checkbox" name="enabled" value="1"' . checked( $s['enabled'], 1, false ) . '> Heti automatikus takarítás bekapcsolása (WP-Cron)</label></p>';
-		echo '<p>Csak az alábbi, biztonságosnak jelölt elemeket törli:</p><ul>';
-		foreach ( self::tasks() as $id => $t ) {
-			if ( ! $t['safe'] ) {
-				continue;
-			}
-			echo '<li><label><input type="checkbox" name="auto_tasks[]" value="' . esc_attr( $id ) . '"' . ( in_array( $id, $s['tasks'], true ) ? ' checked' : '' ) . '> ' . esc_html( $t['label'] ) . '</label></li>';
-		}
-		echo '</ul><p><label><input type="checkbox" name="auto_optimize" value="1"' . checked( $s['optimize'], 1, false ) . '> Utána a töredezett táblák optimalizálása</label></p>';
-		echo '<p><button class="button button-primary">Beállítások mentése</button></p></form>';
-		if ( $s['last_run'] ) {
-			echo '<p>Utolsó automatikus futás: ' . esc_html( wp_date( 'Y.m.d H:i', $s['last_run'] ) ) . ' &ndash; ' . esc_html( $s['last_result'] ) . '</p>';
-		}
-
-		/* 7. Tippek */
-		echo '<h2>7. Megelőzés</h2><ul style="list-style:disc;margin-left:20px">';
-		echo '<li>A <code>wp-config.php</code>-ba: <code>define( \'WP_POST_REVISIONS\', 5 );</code> &ndash; legfeljebb 5 revíziót tart meg bejegyzésenként.</li>';
-		echo '<li>Töröld a már nem használt pluginok maradék tábláit (a fenti táblalista "Forrás" oszlopa segít). Ha a tábla olyan plugin nevét viseli, ami már nincs telepítve, phpMyAdmin-ban biztonsággal eldobható (mentés után).</li>';
-		echo '<li>Naplózó/statisztika pluginoknál (Wordfence, WP Statistics, Activity Log) állítsd rövidre a megőrzési időt, vagy kapcsold ki a naplózást.</li>';
-		echo '</ul></div>';
+		echo '<div class="wrap"><div id="adbopt-app" class="adbopt"><p>Betöltés…</p></div>';
+		echo '<noscript><p>Az And DB fix működéséhez JavaScript szükséges.</p></noscript></div>';
 	}
-
-	/* ------------------------------------------------------------------ */
-	/* Műveletek                                                           */
-	/* ------------------------------------------------------------------ */
 
 	private static function guard( $action ) {
 		if ( ! current_user_can( self::CAP ) ) {
 			wp_die( 'Nincs jogosultságod.', 403 );
 		}
 		check_admin_referer( $action );
-		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 120 ); // phpcs:ignore
-		}
 	}
 
 	private static function back( $msg ) {
-		set_transient( 'adbopt_notice_' . get_current_user_id(), $msg, 120 );
-		wp_safe_redirect( admin_url( 'tools.php?page=' . self::SLUG ) );
-		exit;
+		wp_die( wp_kses_post( $msg ) . ' <a href="' . esc_url( admin_url( 'tools.php?page=' . self::SLUG ) ) . '">Vissza</a>' );
 	}
 
-	private static function show_notice() {
-		$key = 'adbopt_notice_' . get_current_user_id();
-		$msg = get_transient( $key );
-		if ( $msg ) {
-			delete_transient( $key );
-			echo '<div class="notice notice-success is-dismissible"><p>' . wp_kses_post( $msg ) . '</p></div>';
+	private static function payload() {
+		$raw = isset( $_POST['payload'] ) ? wp_unslash( $_POST['payload'] ) : ''; // phpcs:ignore
+		$p   = json_decode( $raw, true );
+		return is_array( $p ) ? $p : array();
+	}
+
+	public static function ajax() {
+		if ( ! current_user_can( self::CAP ) ) {
+			wp_send_json_error( array( 'message' => 'Nincs jogosultságod.' ), 403 );
 		}
+		check_ajax_referer( 'adbopt', 'nonce' );
+		@set_time_limit( 120 ); // phpcs:ignore
+		global $wpdb;
+		$op = isset( $_POST['op'] ) ? sanitize_key( wp_unslash( $_POST['op'] ) ) : '';
+		$p  = self::payload();
+
+		switch ( $op ) {
+			case 'overview':
+				wp_send_json_success( self::op_overview() );
+				break;
+
+			case 'tasks':
+				$list = array();
+				foreach ( self::tasks() as $id => $t ) {
+					$list[] = array(
+						'id'    => $id,
+						'label' => $t['label'],
+						'desc'  => $t['desc'],
+						'safe'  => $t['safe'],
+						'count' => self::task_count( $t ),
+					);
+				}
+				wp_send_json_success( array( 'tasks' => $list ) );
+				break;
+
+			case 'clean':
+				$sel      = isset( $p['tasks'] ) ? array_map( 'sanitize_key', (array) $p['tasks'] ) : array();
+				$deadline = time() + 20;
+				$deleted  = array();
+				$remain   = array();
+				foreach ( self::tasks() as $id => $t ) {
+					if ( ! in_array( $id, $sel, true ) ) {
+						continue;
+					}
+					$deleted[ $id ] = ( time() < $deadline ) ? self::run_task( $t, $deadline ) : 0;
+					$remain[ $id ]  = self::task_count( $t );
+				}
+				wp_cache_flush();
+				delete_transient( 'adbopt_size' );
+				wp_send_json_success( array( 'deleted' => $deleted, 'remaining' => $remain ) );
+				break;
+
+			case 'optimize_one':
+				$name  = isset( $p['table'] ) ? (string) $p['table'] : '';
+				$known = wp_list_pluck( self::table_stats(), 'name' );
+				if ( ! in_array( $name, $known, true ) ) {
+					wp_send_json_error( array( 'message' => 'Ismeretlen tábla.' ) );
+				}
+				$wpdb->query( 'OPTIMIZE TABLE `' . str_replace( '`', '``', $name ) . '`' ); // phpcs:ignore WordPress.DB.PreparedSQL
+				delete_transient( 'adbopt_size' );
+				wp_send_json_success( array( 'table' => $name ) );
+				break;
+
+			case 'droptable':
+				$name  = isset( $p['table'] ) ? (string) $p['table'] : '';
+				$known = wp_list_pluck( self::table_stats(), 'name' );
+				if ( ! in_array( $name, $known, true ) || ! self::can_drop( $name ) ) {
+					wp_send_json_error( array( 'message' => 'Ez a tábla nem törölhető innen.' ) );
+				}
+				$wpdb->query( 'DROP TABLE `' . str_replace( '`', '``', $name ) . '`' ); // phpcs:ignore WordPress.DB.PreparedSQL
+				if ( $wpdb->last_error ) {
+					wp_send_json_error( array( 'message' => $wpdb->last_error ) );
+				}
+				delete_transient( 'adbopt_size' );
+				wp_send_json_success( array( 'table' => $name ) );
+				break;
+
+			case 'noautoload':
+				$name = isset( $p['option'] ) ? (string) $p['option'] : '';
+				if ( '' === $name ) {
+					wp_send_json_error( array( 'message' => 'Hiányzó opciónév.' ) );
+				}
+				$wpdb->update( $wpdb->options, array( 'autoload' => 'no' ), array( 'option_name' => $name ) );
+				wp_cache_delete( 'alloptions', 'options' );
+				wp_send_json_success( array( 'option' => $name ) );
+				break;
+
+			case 'save_settings':
+				wp_send_json_success( array( 'settings' => self::save_settings( $p ) ) );
+				break;
+
+			case 'send_test':
+				$cfg = self::settings();
+				$to  = self::parse_emails( $cfg['emails'] );
+				if ( ! $to ) {
+					wp_send_json_error( array( 'message' => 'Nincs érvényes email cím elmentve. Előbb mentsd a beállításokat.' ) );
+				}
+				$size = self::db_size();
+				$st   = self::status( $size, $cfg['limit_mb'] );
+				$ok   = self::send_mail( $to, 'Teszt üzenet', self::mail_wrap( 'Teszt üzenet', '<p>Ez egy teszt email az And DB fix pluginból. Ha ezt olvasod, a levélküldés működik.</p>' . self::status_html( $size, $st ) ) );
+				if ( ! $ok ) {
+					wp_send_json_error( array( 'message' => 'A levél elküldése nem sikerült (a tárhely levélküldés-beállítása?).' ) );
+				}
+				wp_send_json_success( array( 'sent_to' => $to ) );
+				break;
+		}
+		wp_send_json_error( array( 'message' => 'Ismeretlen művelet.' ) );
 	}
 
-	public static function handle_clean() {
-		self::guard( 'adbopt_clean' );
-		$sel   = isset( $_POST['tasks'] ) ? array_map( 'sanitize_key', (array) wp_unslash( $_POST['tasks'] ) ) : array();
-		$out   = self::run_selected( $sel, 25 );
-		$msg   = $out ? implode( '<br>', $out ) : 'Nem jelöltél ki semmit.';
-		$msg  .= '<br>Ha még maradt találat, futtasd újra a törlést (időkorlát miatt részletekben dolgozik). Végül futtasd az optimalizálást is.';
-		wp_cache_flush();
-		self::back( $msg );
+	private static function op_overview() {
+		global $wpdb;
+		$s      = self::settings();
+		$tables = array();
+		$total  = 0;
+		foreach ( self::table_stats() as $t ) {
+			$sum      = (int) $t->data_len + (int) $t->index_len;
+			$total   += $sum;
+			$tables[] = array(
+				'name'   => $t->name,
+				'owner'  => self::table_owner( $t->name ),
+				'engine' => (string) $t->engine,
+				'rows'   => (int) $t->row_count,
+				'data'   => (int) $t->data_len,
+				'index'  => (int) $t->index_len,
+				'total'  => $sum,
+				'free'   => (int) $t->free_len,
+				'drop'   => self::can_drop( $t->name ),
+			);
+		}
+		set_transient( 'adbopt_size', $total, 10 * MINUTE_IN_SECONDS );
+
+		$in        = self::autoload_sql_list();
+		$row       = $wpdb->get_row( "SELECT COUNT(*) AS c, SUM(LENGTH(option_value)) AS s FROM {$wpdb->options} WHERE autoload IN ({$in})" ); // phpcs:ignore WordPress.DB.PreparedSQL
+		$protected = array( 'siteurl', 'home', 'blogname', 'active_plugins', 'template', 'stylesheet', 'rewrite_rules', 'cron', 'permalink_structure', 'users_can_register', 'default_role', 'WPLANG' );
+		$opts      = array();
+		foreach ( $wpdb->get_results( "SELECT option_name, autoload, LENGTH(option_value) AS len FROM {$wpdb->options} ORDER BY len DESC LIMIT 30" ) as $o ) { // phpcs:ignore WordPress.DB.PreparedSQL
+			$auto   = in_array( $o->autoload, self::autoload_values(), true );
+			$opts[] = array(
+				'name'    => $o->option_name,
+				'owner'   => self::option_owner( $o->option_name ),
+				'len'     => (int) $o->len,
+				'auto'    => $auto,
+				'can_off' => $auto && ! in_array( $o->option_name, $protected, true ),
+			);
+		}
+		$next = wp_next_scheduled( self::CRON_HOOK );
+
+		return array(
+			'db_name'    => DB_NAME,
+			'prefix'     => $wpdb->prefix,
+			'total'      => $total,
+			'status'     => self::status( $total, $s['limit_mb'] ),
+			'tables'     => $tables,
+			'autoload'   => array( 'count' => (int) $row->c, 'size' => (int) $row->s ),
+			'options'    => $opts,
+			'settings'   => $s,
+			'gzip'       => function_exists( 'deflate_init' ),
+			'next_clean' => $next ? wp_date( 'Y.m.d H:i', $next ) : '',
+			'last_run'   => $s['last_run'] ? wp_date( 'Y.m.d H:i', $s['last_run'] ) : '',
+			'safe_tasks' => array_keys( array_filter( self::tasks(), function ( $t ) {
+				return $t['safe'];
+			} ) ),
+		);
 	}
 
 	/** @return string[] */
@@ -663,39 +757,288 @@ final class ADBOPT {
 				continue;
 			}
 			if ( time() >= $deadline ) {
-				$out[] = esc_html( $t['label'] ) . ': kimaradt az időkorlát miatt, futtasd újra.';
+				$out[] = $t['label'] . ': kimaradt az időkorlát miatt';
 				continue;
 			}
-			$out[] = esc_html( $t['label'] ) . ': <strong>' . number_format_i18n( self::run_task( $t, $deadline ) ) . '</strong> db törölve';
+			$out[] = $t['label'] . ': ' . self::run_task( $t, $deadline ) . ' db törölve';
 		}
 		return $out;
 	}
 
-	private static function optimize_tables( $scope, $seconds ) {
-		global $wpdb;
-		$deadline = time() + $seconds;
-		$done     = 0;
-		foreach ( self::table_stats() as $t ) {
-			if ( 'overhead' === $scope && (int) $t->free_len < 1048576 ) {
-				continue;
+	/* ------------------------------------------------------------------ */
+	/* Beállítások                                                         */
+	/* ------------------------------------------------------------------ */
+
+	public static function settings() {
+		return wp_parse_args(
+			get_option( self::OPT, array() ),
+			array(
+				'enabled'       => 0,
+				'tasks'         => array(),
+				'optimize'      => 0,
+				'last_run'      => 0,
+				'last_result'   => '',
+				'limit_mb'      => 100,
+				'emails'        => '',
+				'mail_monthly'  => 0,
+				'mail_70'       => 0,
+				'mail_80'       => 0,
+				'mail_95'       => 0,
+				'mail_95_hours' => 24,
+				'last_level'    => 0,
+				'last_95_sent'  => 0,
+				'last_monthly'  => '',
+			)
+		);
+	}
+
+	public static function parse_emails( $str ) {
+		$ok = array();
+		foreach ( preg_split( '/[\s,;]+/', (string) $str, -1, PREG_SPLIT_NO_EMPTY ) as $x ) {
+			$e = sanitize_email( $x );
+			if ( $e && is_email( $e ) ) {
+				$ok[] = $e;
 			}
-			if ( time() >= $deadline ) {
-				break;
-			}
-			// A név az information_schema-ból jön, és visszaquote-oljuk.
-			$wpdb->query( 'OPTIMIZE TABLE `' . str_replace( '`', '``', $t->name ) . '`' ); // phpcs:ignore WordPress.DB.PreparedSQL
-			$done++;
 		}
-		return $done;
+		return array_values( array_unique( $ok ) );
 	}
 
-	public static function handle_optimize() {
-		self::guard( 'adbopt_optimize' );
-		$scope = ( isset( $_POST['scope'] ) && 'all' === $_POST['scope'] ) ? 'all' : 'overhead';
-		$n     = self::optimize_tables( $scope, 60 );
-		self::back( 'Optimalizált táblák száma: <strong>' . (int) $n . '</strong>. Az új méretet lent láthatod.' );
+	private static function save_settings( $p ) {
+		$s    = self::settings();
+		$safe = array_keys( array_filter( self::tasks(), function ( $t ) {
+			return $t['safe'];
+		} ) );
+
+		$s['limit_mb']      = max( 0, (int) ( isset( $p['limit_mb'] ) ? $p['limit_mb'] : 100 ) );
+		$s['enabled']       = empty( $p['enabled'] ) ? 0 : 1;
+		$s['optimize']      = empty( $p['optimize'] ) ? 0 : 1;
+		$chosen             = isset( $p['tasks'] ) ? array_map( 'sanitize_key', (array) $p['tasks'] ) : array();
+		$s['tasks']         = array_values( array_intersect( $chosen, $safe ) );
+		$s['emails']        = implode( ', ', self::parse_emails( isset( $p['emails'] ) ? $p['emails'] : '' ) );
+		$s['mail_monthly']  = empty( $p['mail_monthly'] ) ? 0 : 1;
+		$s['mail_70']       = empty( $p['mail_70'] ) ? 0 : 1;
+		$s['mail_80']       = empty( $p['mail_80'] ) ? 0 : 1;
+		$s['mail_95']       = empty( $p['mail_95'] ) ? 0 : 1;
+		$s['mail_95_hours'] = max( 1, min( 720, (int) ( isset( $p['mail_95_hours'] ) ? $p['mail_95_hours'] : 24 ) ) );
+		if ( $s['mail_monthly'] && '' === $s['last_monthly'] ) {
+			$s['last_monthly'] = wp_date( 'Y-m' ); // az első jelentés a következő hónap elején megy
+		}
+		update_option( self::OPT, $s, false );
+		delete_transient( 'adbopt_size' );
+
+		wp_clear_scheduled_hook( self::CRON_HOOK );
+		if ( $s['enabled'] ) {
+			wp_schedule_event( time() + HOUR_IN_SECONDS, 'weekly', self::CRON_HOOK );
+		}
+		return $s;
 	}
 
+	/* ------------------------------------------------------------------ */
+	/* Cron: heti takarítás, óránkénti ellenőrzés, napi pillanatkép        */
+	/* ------------------------------------------------------------------ */
+
+	public static function run_cron() {
+		$s = self::settings();
+		if ( ! $s['enabled'] ) {
+			return;
+		}
+		@set_time_limit( 300 ); // phpcs:ignore
+		$out = self::run_selected( $s['tasks'], 120 );
+		if ( $s['optimize'] ) {
+			$n = 0;
+			global $wpdb;
+			foreach ( self::table_stats() as $t ) {
+				if ( (int) $t->free_len >= 1048576 ) {
+					$wpdb->query( 'OPTIMIZE TABLE `' . str_replace( '`', '``', $t->name ) . '`' ); // phpcs:ignore WordPress.DB.PreparedSQL
+					$n++;
+				}
+			}
+			$out[] = 'Optimalizált táblák: ' . $n;
+		}
+		delete_transient( 'adbopt_size' );
+		$s                = self::settings();
+		$s['last_run']    = time();
+		$s['last_result'] = wp_strip_all_tags( implode( '; ', $out ) );
+		update_option( self::OPT, $s, false );
+	}
+
+	public static function run_hourly() {
+		@set_time_limit( 120 ); // phpcs:ignore
+		self::take_snapshot();
+		$s = self::settings();
+		if ( ! self::parse_emails( $s['emails'] ) ) {
+			return;
+		}
+		self::check_alerts();
+		$s = self::settings();
+		if ( $s['mail_monthly'] && wp_date( 'Y-m' ) !== $s['last_monthly'] ) {
+			if ( self::send_monthly() ) {
+				$s                 = self::settings();
+				$s['last_monthly'] = wp_date( 'Y-m' );
+				update_option( self::OPT, $s, false );
+			}
+		}
+	}
+
+	/** Napi pillanatkép: teljes méret + forrásonkénti méret. */
+	public static function take_snapshot() {
+		$snaps = get_option( self::SNAP, array() );
+		$today = wp_date( 'Y-m-d' );
+		if ( isset( $snaps[ $today ] ) ) {
+			return;
+		}
+		$owners = array();
+		$total  = 0;
+		foreach ( self::table_stats() as $t ) {
+			$sum          = (int) $t->data_len + (int) $t->index_len;
+			$o            = self::table_owner( $t->name );
+			$owners[ $o ] = ( isset( $owners[ $o ] ) ? $owners[ $o ] : 0 ) + $sum;
+			$total       += $sum;
+		}
+		$snaps[ $today ] = array( 'total' => $total, 'owners' => $owners );
+		ksort( $snaps );
+		$cut = gmdate( 'Y-m-d', time() - 400 * DAY_IN_SECONDS );
+		foreach ( array_keys( $snaps ) as $d ) {
+			if ( $d < $cut ) {
+				unset( $snaps[ $d ] );
+			}
+		}
+		update_option( self::SNAP, $snaps, false );
+	}
+
+	public static function check_alerts() {
+		$s     = self::settings();
+		$to    = self::parse_emails( $s['emails'] );
+		$size  = self::db_size();
+		$st    = self::status( $size, $s['limit_mb'] );
+		$level = max( 0, $st['level'] );
+		$last  = (int) $s['last_level'];
+		$send  = false;
+
+		if ( $level > $last ) {
+			$send = ( 1 === $level && $s['mail_70'] ) || ( 2 === $level && $s['mail_80'] ) || ( 3 === $level && $s['mail_95'] );
+		} elseif ( 3 === $level && $s['mail_95'] && time() - (int) $s['last_95_sent'] >= (int) $s['mail_95_hours'] * HOUR_IN_SECONDS ) {
+			$send = true;
+		}
+
+		if ( $send && $to ) {
+			$title = ( 3 === $level ? 'KRITIKUS: ' : 'Figyelmeztetés: ' ) . 'az adatbázis a limit ' . $st['pct'] . '%-án áll';
+			self::send_mail( $to, $title, self::mail_wrap( $title, '<p>' . esc_html( $st['message'] ) . '</p>' . self::status_html( $size, $st ) . self::owners_table_html( 6 ) ) );
+			if ( 3 === $level ) {
+				$s['last_95_sent'] = time();
+			}
+		}
+		$s['last_level'] = $level;
+		update_option( self::OPT, $s, false );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Levelek                                                             */
+	/* ------------------------------------------------------------------ */
+
+	private static function send_mail( $to, $subject, $html ) {
+		$subject = '[' . wp_specialchars_decode( get_bloginfo( 'name' ), ENT_QUOTES ) . '] ' . $subject;
+		return wp_mail( $to, $subject, $html, array( 'Content-Type: text/html; charset=UTF-8' ) );
+	}
+
+	private static function mail_wrap( $title, $body ) {
+		return '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1d2327;max-width:640px">'
+			. '<h2 style="margin:0 0 12px">' . esc_html( $title ) . '</h2>'
+			. '<p style="color:#555">Oldal: <a href="' . esc_url( home_url() ) . '">' . esc_html( home_url() ) . '</a></p>'
+			. $body
+			. '<p style="color:#777;font-size:12px;margin-top:20px">Küldte: And DB fix ' . esc_html( self::VER ) . ' &middot; <a href="' . esc_url( admin_url( 'tools.php?page=' . self::SLUG ) ) . '">megnyitás</a></p></div>';
+	}
+
+	private static function status_html( $size, $st ) {
+		list( $bg, $fg ) = self::level_colors( $st['level'] );
+		$txt = size_format( $size, 2 ) . ( $st['limit'] ? ' / ' . size_format( $st['limit'], 0 ) . ' (' . $st['pct'] . '%)' : ' (nincs limit)' );
+		return '<p><span style="display:inline-block;background:' . $bg . ';color:' . $fg . ';padding:6px 12px;border-radius:4px;font-weight:bold;font-size:16px">' . esc_html( $txt ) . '</span></p>';
+	}
+
+	/** Jelenlegi méret forrásonként (legnagyobb elöl). */
+	private static function owners_table_html( $limit ) {
+		$o = array();
+		foreach ( self::table_stats() as $t ) {
+			$k       = self::table_owner( $t->name );
+			$o[ $k ] = ( isset( $o[ $k ] ) ? $o[ $k ] : 0 ) + $t->data_len + $t->index_len;
+		}
+		arsort( $o );
+		$h = '<h3>Legnagyobb helyfoglalók</h3><table cellpadding="6" style="border-collapse:collapse;border:1px solid #ddd"><tr style="background:#f3f4f6"><th align="left">Forrás</th><th align="right">Méret</th></tr>';
+		foreach ( array_slice( $o, 0, $limit, true ) as $name => $sz ) {
+			$h .= '<tr><td style="border-top:1px solid #eee">' . esc_html( $name ) . '</td><td align="right" style="border-top:1px solid #eee">' . esc_html( size_format( $sz, 2 ) ) . '</td></tr>';
+		}
+		return $h . '</table>';
+	}
+
+	public static function send_monthly() {
+		$s  = self::settings();
+		$to = self::parse_emails( $s['emails'] );
+		if ( ! $to ) {
+			return false;
+		}
+		self::take_snapshot();
+		$size  = self::db_size();
+		$st    = self::status( $size, $s['limit_mb'] );
+		$snaps = get_option( self::SNAP, array() );
+		ksort( $snaps );
+
+		$cur_month  = wp_date( 'Y-m' );
+		$prev_month = gmdate( 'Y-m', strtotime( $cur_month . '-15 -1 month' ) );
+		$prev_first = $prev_month . '-01';
+
+		$base      = null;
+		$base_date = '';
+		foreach ( $snaps as $d => $v ) {
+			if ( $d < $prev_first ) {
+				$base      = $v;
+				$base_date = $d;
+			}
+		}
+		$partial = false;
+		if ( null === $base ) { // nincs előzmény a hónap előttről: a hónap első pillanatképe
+			foreach ( $snaps as $d => $v ) {
+				if ( $d >= $prev_first ) {
+					$base      = $v;
+					$base_date = $d;
+					$partial   = true;
+					break;
+				}
+			}
+		}
+		$end = end( $snaps );
+
+		$body  = '<p>' . esc_html( $st['message'] ) . '</p>' . self::status_html( $size, $st );
+		$body .= '<h3>' . esc_html( $prev_month ) . ' &ndash; mennyit írtak az adatbázisba?</h3>';
+		if ( $base && $end && $base_date !== wp_date( 'Y-m-d' ) ) {
+			$delta = array();
+			foreach ( array_unique( array_merge( array_keys( $base['owners'] ), array_keys( $end['owners'] ) ) ) as $o ) {
+				$b = isset( $base['owners'][ $o ] ) ? $base['owners'][ $o ] : 0;
+				$e = isset( $end['owners'][ $o ] ) ? $end['owners'][ $o ] : 0;
+				if ( $e !== $b ) {
+					$delta[ $o ] = array( $e - $b, $e );
+				}
+			}
+			uasort( $delta, function ( $a, $b ) {
+				return $b[0] <=> $a[0];
+			} );
+			$body .= '<p>Teljes változás: <strong>' . esc_html( ( $end['total'] >= $base['total'] ? '+' : '-' ) . size_format( abs( $end['total'] - $base['total'] ), 2 ) ) . '</strong>. A számok nettó változások: a törlések levonódnak.</p>';
+			if ( $partial ) {
+				$body .= '<p style="color:#b45309">Megjegyzés: a mérés ' . esc_html( $base_date ) . ' napján indult, ezért a hónap eleje hiányos.</p>';
+			}
+			if ( $delta ) {
+				$body .= '<table cellpadding="6" style="border-collapse:collapse;border:1px solid #ddd"><tr style="background:#f3f4f6"><th align="left">Szolgáltatás / plugin</th><th align="right">Változás</th><th align="right">Jelenlegi méret</th></tr>';
+				foreach ( array_slice( $delta, 0, 15, true ) as $o => $v ) {
+					$body .= '<tr><td style="border-top:1px solid #eee">' . esc_html( $o ) . '</td><td align="right" style="border-top:1px solid #eee">' . esc_html( ( $v[0] >= 0 ? '+' : '-' ) . size_format( abs( $v[0] ), 2 ) ) . '</td><td align="right" style="border-top:1px solid #eee">' . esc_html( size_format( $v[1], 2 ) ) . '</td></tr>';
+				}
+				$body .= '</table>';
+			} else {
+				$body .= '<p>Nem volt méretváltozás.</p>';
+			}
+		} else {
+			$body .= '<p>Még nincs elég mért előzmény (a napi mérés most indult); a következő jelentésben már lesz hónapos összehasonlítás.</p>' . self::owners_table_html( 10 );
+		}
+		return self::send_mail( $to, 'Havi adatbázis-jelentés (' . $prev_month . ')', self::mail_wrap( 'Havi adatbázis-jelentés', $body ) );
+	}
 	/* ------------------------------------------------------------------ */
 	/* Biztonsági mentés (SQL dump, streamelve)                            */
 	/* ------------------------------------------------------------------ */
@@ -709,6 +1052,10 @@ final class ADBOPT {
 
 	public static function handle_backup() {
 		self::guard( 'adbopt_backup' );
+		$token = isset( $_POST['token'] ) ? preg_replace( '/[^a-z0-9]/i', '', wp_unslash( $_POST['token'] ) ) : ''; // phpcs:ignore
+		if ( '' !== $token ) {
+			setcookie( 'adbopt_dl', $token, time() + 600, '/' );
+		}
 		global $wpdb;
 		$db = $wpdb->dbh;
 		if ( ! ( $db instanceof mysqli ) ) {
@@ -815,80 +1162,6 @@ final class ADBOPT {
 		return 'WordPress mag' !== self::table_owner( $name );
 	}
 
-	public static function handle_droptable() {
-		self::guard( 'adbopt_droptable' );
-		global $wpdb;
-		$name  = isset( $_POST['table'] ) ? wp_unslash( $_POST['table'] ) : ''; // phpcs:ignore
-		$known = wp_list_pluck( self::table_stats(), 'name' );
-		if ( ! in_array( $name, $known, true ) || ! self::can_drop( $name ) ) {
-			self::back( 'Ez a tábla nem törölhető innen.' );
-		}
-		$wpdb->query( 'DROP TABLE `' . str_replace( '`', '``', $name ) . '`' ); // phpcs:ignore WordPress.DB.PreparedSQL
-		self::back( $wpdb->last_error ? 'Hiba: ' . esc_html( $wpdb->last_error ) : 'Tábla törölve: <code>' . esc_html( $name ) . '</code>' );
-	}
-
-	public static function handle_noautoload() {
-		self::guard( 'adbopt_noautoload' );
-		global $wpdb;
-		$name = isset( $_POST['option'] ) ? wp_unslash( $_POST['option'] ) : ''; // phpcs:ignore
-		if ( '' === $name ) {
-			self::back( 'Hiányzó opciónév.' );
-		}
-		$wpdb->update( $wpdb->options, array( 'autoload' => 'no' ), array( 'option_name' => $name ) );
-		wp_cache_delete( 'alloptions', 'options' );
-		self::back( 'Autoload kikapcsolva: <code>' . esc_html( $name ) . '</code>' );
-	}
-
-	/* ------------------------------------------------------------------ */
-	/* Beállítások + cron                                                  */
-	/* ------------------------------------------------------------------ */
-
-	public static function settings() {
-		return wp_parse_args(
-			get_option( self::OPT, array() ),
-			array(
-				'enabled'     => 0,
-				'tasks'       => array(),
-				'optimize'    => 0,
-				'last_run'    => 0,
-				'last_result' => '',
-			)
-		);
-	}
-
-	public static function handle_settings() {
-		self::guard( 'adbopt_settings' );
-		$s             = self::settings();
-		$safe          = array_keys( array_filter( self::tasks(), function ( $t ) {
-			return $t['safe'];
-		} ) );
-		$s['enabled']  = empty( $_POST['enabled'] ) ? 0 : 1;
-		$s['optimize'] = empty( $_POST['auto_optimize'] ) ? 0 : 1;
-		$chosen        = isset( $_POST['auto_tasks'] ) ? array_map( 'sanitize_key', (array) wp_unslash( $_POST['auto_tasks'] ) ) : array();
-		$s['tasks']    = array_values( array_intersect( $chosen, $safe ) );
-		update_option( self::OPT, $s, false );
-
-		wp_clear_scheduled_hook( self::CRON_HOOK );
-		if ( $s['enabled'] ) {
-			wp_schedule_event( time() + HOUR_IN_SECONDS, 'weekly', self::CRON_HOOK );
-		}
-		self::back( 'Beállítások elmentve.' );
-	}
-
-	public static function run_cron() {
-		$s = self::settings();
-		if ( ! $s['enabled'] ) {
-			return;
-		}
-		@set_time_limit( 300 ); // phpcs:ignore
-		$out = self::run_selected( $s['tasks'], 120 );
-		if ( $s['optimize'] ) {
-			$out[] = 'Optimalizált táblák: ' . self::optimize_tables( 'overhead', 120 );
-		}
-		$s['last_run']    = time();
-		$s['last_result'] = wp_strip_all_tags( implode( '; ', $out ) );
-		update_option( self::OPT, $s, false );
-	}
 }
 
 // A heti ütemezés a WordPress beépített "weekly" intervalluma (6.1-től része a magnak); régebbi verzión pótoljuk.
