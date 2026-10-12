@@ -3,7 +3,7 @@
  * Plugin Name: And DB fix
  * Plugin URI: https://github.com/galandras12/and_fix_db
  * Description: Megmutatja, mi foglalja az adatbázis tárhelyét (táblák, autoload opciók, pluginok), felesleges adatokat detektál és törli, táblákat optimalizál, opcionálisan hetente automatikusan takarít.
- * Version: 1.0
+ * Version: 1.1
  * Author: galandras12, Claude Code
  * Author URI: https://github.com/galandras12/and_fix_db
  * Requires at least: 5.0
@@ -28,6 +28,7 @@ final class ADBOPT {
 		add_action( 'admin_post_adbopt_clean', array( __CLASS__, 'handle_clean' ) );
 		add_action( 'admin_post_adbopt_optimize', array( __CLASS__, 'handle_optimize' ) );
 		add_action( 'admin_post_adbopt_settings', array( __CLASS__, 'handle_settings' ) );
+		add_action( 'admin_post_adbopt_backup', array( __CLASS__, 'handle_backup' ) );
 		add_action( 'admin_post_adbopt_droptable', array( __CLASS__, 'handle_droptable' ) );
 		add_action( 'admin_post_adbopt_noautoload', array( __CLASS__, 'handle_noautoload' ) );
 		add_action( self::CRON_HOOK, array( __CLASS__, 'run_cron' ) );
@@ -492,6 +493,16 @@ final class ADBOPT {
 		echo ' &ndash; ebből felszabadítható töredezettség (overhead): ' . esc_html( size_format( $total_ov, 2 ) ) . '.<br>';
 		echo 'A tárhelyszolgáltató az adatbázis <em>összes</em> táblájának méretét számolja, a más előtaggal rendelkező (pl. másik WP-telepítés vagy törölt plugin maradék) táblákat is.</p></div>';
 
+		/* 0. Mentés */
+		echo '<h2>Biztonsági mentés</h2>';
+		echo '<p>Egy kattintással letölthető SQL-mentés az adatbázis <code>' . esc_html( $wpdb->prefix ) . '</code> előtagú tábláiról. A fájlnév az oldal címét és a dátum-időt tartalmazza. Visszatöltés: phpMyAdmin → Importálás (a .sql.gz fájlt is kicsomagolás nélkül elfogadja). <strong>Törlés előtt érdemes lementeni.</strong></p>';
+		self::post_form_open( 'adbopt_backup' );
+		echo '<button class="button button-primary" name="gz" value="0">Mentés letöltése (.sql)</button> ';
+		if ( function_exists( 'deflate_init' ) ) {
+			echo '<button class="button" name="gz" value="1">Tömörített mentés (.sql.gz, kisebb)</button>';
+		}
+		echo '</form>';
+
 		/* 1. Táblák */
 		echo '<h2>1. Táblák mérete (legnagyobb elöl)</h2>';
 		echo '<p>A sorszám becsült érték (InnoDB). A "Forrás" oszlop a tábla nevéből következtet arra, melyik plugin vagy WordPress-rész hozta létre.</p>';
@@ -683,6 +694,103 @@ final class ADBOPT {
 		$scope = ( isset( $_POST['scope'] ) && 'all' === $_POST['scope'] ) ? 'all' : 'overhead';
 		$n     = self::optimize_tables( $scope, 60 );
 		self::back( 'Optimalizált táblák száma: <strong>' . (int) $n . '</strong>. Az új méretet lent láthatod.' );
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Biztonsági mentés (SQL dump, streamelve)                            */
+	/* ------------------------------------------------------------------ */
+
+	private static function backup_filename( $gz ) {
+		$host = wp_parse_url( home_url(), PHP_URL_HOST );
+		$path = trim( (string) wp_parse_url( home_url(), PHP_URL_PATH ), '/' );
+		$site = sanitize_file_name( $host . ( $path ? '-' . str_replace( '/', '-', $path ) : '' ) );
+		return $site . '_' . wp_date( 'Y-m-d_H-i-s' ) . '.sql' . ( $gz ? '.gz' : '' );
+	}
+
+	public static function handle_backup() {
+		self::guard( 'adbopt_backup' );
+		global $wpdb;
+		$db = $wpdb->dbh;
+		if ( ! ( $db instanceof mysqli ) ) {
+			self::back( 'A mentés mysqli adatbáziskapcsolatot igényel, ez a környezet nem ilyen.' );
+		}
+		$gz = ! empty( $_POST['gz'] ) && function_exists( 'deflate_init' );
+		@set_time_limit( 0 ); // phpcs:ignore
+		@ignore_user_abort( true ); // phpcs:ignore
+		while ( ob_get_level() ) {
+			ob_end_clean();
+		}
+
+		nocache_headers();
+		header( 'Content-Type: ' . ( $gz ? 'application/gzip' : 'application/sql; charset=utf-8' ) );
+		header( 'Content-Disposition: attachment; filename="' . self::backup_filename( $gz ) . '"' );
+		header( 'X-Accel-Buffering: no' );
+
+		$ctx = $gz ? deflate_init( ZLIB_ENCODING_GZIP ) : null;
+		$out = function ( $chunk ) use ( $ctx ) {
+			echo $ctx ? deflate_add( $ctx, $chunk, ZLIB_NO_FLUSH ) : $chunk; // phpcs:ignore
+			if ( ! $ctx || mt_rand( 1, 20 ) === 1 ) {
+				flush();
+			}
+		};
+
+		$out( "-- And DB fix biztonsági mentés\n-- Oldal: " . home_url() . "\n-- Adatbázis: " . DB_NAME . "\n-- Dátum: " . wp_date( 'Y-m-d H:i:s' ) . "\n\n" );
+		$out( "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\nSET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n\n" );
+
+		foreach ( self::table_stats() as $t ) {
+			if ( 0 !== strpos( $t->name, $wpdb->prefix ) ) {
+				continue;
+			}
+			$q   = '`' . str_replace( '`', '``', $t->name ) . '`';
+			$row = $db->query( "SHOW CREATE TABLE {$q}" )->fetch_row();
+			if ( empty( $row[1] ) ) {
+				continue; // nézet vagy elérhetetlen
+			}
+			$out( "DROP TABLE IF EXISTS {$q};\n{$row[1]};\n\n" );
+
+			$res = $db->query( "SELECT * FROM {$q}", MYSQLI_USE_RESULT );
+			if ( ! $res ) {
+				continue;
+			}
+			$fields = $res->fetch_fields();
+			$hexcol = array();
+			foreach ( $fields as $i => $f ) {
+				$hexcol[ $i ] = ( 63 === $f->charsetnr && in_array( $f->type, array( 16, 249, 250, 251, 252, 253, 254 ), true ) );
+			}
+			$cols  = '`' . implode( '`,`', array_map( function ( $f ) {
+				return str_replace( '`', '``', $f->name );
+			}, $fields ) ) . '`';
+			$buf   = '';
+			$count = 0;
+			while ( $r = $res->fetch_row() ) {
+				$vals = array();
+				foreach ( $r as $i => $v ) {
+					if ( null === $v ) {
+						$vals[] = 'NULL';
+					} elseif ( $hexcol[ $i ] ) {
+						$vals[] = '' === $v ? "''" : '0x' . bin2hex( $v );
+					} else {
+						$vals[] = "'" . $db->real_escape_string( $v ) . "'";
+					}
+				}
+				$buf .= ( '' === $buf ? "INSERT INTO {$q} ({$cols}) VALUES\n(" : ",\n(" ) . implode( ',', $vals ) . ')';
+				$count++;
+				if ( strlen( $buf ) > 500000 ) {
+					$out( $buf . ";\n" );
+					$buf = '';
+				}
+			}
+			$res->free();
+			if ( '' !== $buf ) {
+				$out( $buf . ";\n" );
+			}
+			$out( "\n" );
+		}
+		$out( "SET FOREIGN_KEY_CHECKS=1;\n-- Vége\n" );
+		if ( $ctx ) {
+			echo deflate_add( $ctx, '', ZLIB_FINISH ); // phpcs:ignore
+		}
+		exit;
 	}
 
 	private static function core_table_names() {

@@ -1,4 +1,4 @@
-# And DB fix (WordPress plugin) – v1.0
+# And DB fix (WordPress plugin) – v1.1
 
 Fejlesztő: galandras12, Claude Code · https://github.com/galandras12/and_fix_db
 
@@ -19,3 +19,5 @@ Megmutatja, mi foglalja az adatbázist, és törli a felesleget.
 - Törlés előtt **készíts mentést**.
 - Ha 400 MB-ot mutat, de a táblák összege kisebb, vagy olyan táblák vannak, amelyek már nem telepített plugin maradékai, azokat phpMyAdminban kell eldobni (a plugin csak listázza őket).
 - Nem teszteltem élő WordPress/MySQL környezetben; először teszt- vagy mentett oldalon próbáld ki.
+- Biztonsági mentés gomb: SQL (vagy .sql.gz) letöltés `oldalcím_dátum_idő.sql` néven, phpMyAdminban visszatölthető.
+- Tábla törlése (DROP) gomb a maradék plugin-táblákhoz.
