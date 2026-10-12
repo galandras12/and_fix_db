@@ -28,6 +28,7 @@ final class ADBOPT {
 		add_action( 'admin_post_adbopt_clean', array( __CLASS__, 'handle_clean' ) );
 		add_action( 'admin_post_adbopt_optimize', array( __CLASS__, 'handle_optimize' ) );
 		add_action( 'admin_post_adbopt_settings', array( __CLASS__, 'handle_settings' ) );
+		add_action( 'admin_post_adbopt_droptable', array( __CLASS__, 'handle_droptable' ) );
 		add_action( 'admin_post_adbopt_noautoload', array( __CLASS__, 'handle_noautoload' ) );
 		add_action( self::CRON_HOOK, array( __CLASS__, 'run_cron' ) );
 	}
@@ -494,7 +495,7 @@ final class ADBOPT {
 		/* 1. Táblák */
 		echo '<h2>1. Táblák mérete (legnagyobb elöl)</h2>';
 		echo '<p>A sorszám becsült érték (InnoDB). A "Forrás" oszlop a tábla nevéből következtet arra, melyik plugin vagy WordPress-rész hozta létre.</p>';
-		echo '<table class="widefat striped"><thead><tr><th>Tábla</th><th>Forrás</th><th>Sorok (~)</th><th>Adat</th><th>Index</th><th>Összesen</th><th>Overhead</th></tr></thead><tbody>';
+		echo '<table class="widefat striped"><thead><tr><th>Tábla</th><th>Forrás</th><th>Sorok (~)</th><th>Adat</th><th>Index</th><th>Összesen</th><th>Overhead</th><th></th></tr></thead><tbody>';
 		$shown = 0;
 		foreach ( $tables as $t ) {
 			if ( $shown++ >= 40 ) {
@@ -505,9 +506,16 @@ final class ADBOPT {
 			echo '<tr' . $style . '><td><code>' . esc_html( $t->name ) . '</code></td><td>' . esc_html( self::table_owner( $t->name ) ) . '</td>';
 			echo '<td>' . esc_html( number_format_i18n( (int) $t->row_count ) ) . '</td>';
 			echo '<td>' . esc_html( size_format( $t->data_len, 2 ) ) . '</td><td>' . esc_html( size_format( $t->index_len, 2 ) ) . '</td>';
-			echo '<td><strong>' . esc_html( size_format( $sum, 2 ) ) . '</strong></td><td>' . esc_html( size_format( (int) $t->free_len, 2 ) ) . '</td></tr>';
+			echo '<td><strong>' . esc_html( size_format( $sum, 2 ) ) . '</strong></td><td>' . esc_html( size_format( (int) $t->free_len, 2 ) ) . '</td><td>';
+			if ( self::can_drop( $t->name ) ) {
+				self::post_form_open( 'adbopt_droptable' );
+				echo '<input type="hidden" name="table" value="' . esc_attr( $t->name ) . '">';
+				echo '<button class="button button-small" onclick="return confirm(\'VÉGLEGESEN törlöd a(z) ' . esc_js( $t->name ) . ' táblát? Csak akkor tedd, ha a hozzá tartozó plugin már nincs telepítve, és van mentésed!\')">Tábla törlése</button></form>';
+			}
+			echo '</td></tr>';
 		}
 		echo '</tbody></table>';
+		echo '<p class="description">A "Tábla törlése" gomb csak a WordPress maghoz nem tartozó, ehhez a telepítéshez tartozó (azonos előtagú) táblákon jelenik meg. Olyan plugin táblájára használd, amely már nincs telepítve (pl. kitörölt Wordfence: <code>wfconfig</code>, <code>wfhits</code>, <code>wfknownfilelist</code> stb.).</p>';
 		if ( count( $tables ) > 40 ) {
 			echo '<p>(Csak a 40 legnagyobb tábla látszik; összesen ' . (int) count( $tables ) . ' van.)</p>';
 		}
@@ -675,6 +683,40 @@ final class ADBOPT {
 		$scope = ( isset( $_POST['scope'] ) && 'all' === $_POST['scope'] ) ? 'all' : 'overhead';
 		$n     = self::optimize_tables( $scope, 60 );
 		self::back( 'Optimalizált táblák száma: <strong>' . (int) $n . '</strong>. Az új méretet lent láthatod.' );
+	}
+
+	private static function core_table_names() {
+		global $wpdb;
+		$names = array();
+		foreach ( array( 'posts', 'postmeta', 'options', 'comments', 'commentmeta', 'users', 'usermeta', 'terms', 'termmeta', 'term_taxonomy', 'term_relationships', 'links' ) as $c ) {
+			$names[] = $wpdb->prefix . $c;
+			$names[] = $wpdb->base_prefix . $c;
+		}
+		foreach ( array( 'blogs', 'blogmeta', 'site', 'sitemeta', 'signups', 'registration_log', 'blog_versions' ) as $c ) {
+			$names[] = $wpdb->base_prefix . $c;
+		}
+		return $names;
+	}
+
+	/** Törölhető-e a tábla a felületről: ugyanazon előtag, nem WP-mag. */
+	public static function can_drop( $name ) {
+		global $wpdb;
+		if ( 0 !== strpos( $name, $wpdb->prefix ) || in_array( $name, self::core_table_names(), true ) ) {
+			return false;
+		}
+		return 'WordPress mag' !== self::table_owner( $name );
+	}
+
+	public static function handle_droptable() {
+		self::guard( 'adbopt_droptable' );
+		global $wpdb;
+		$name  = isset( $_POST['table'] ) ? wp_unslash( $_POST['table'] ) : ''; // phpcs:ignore
+		$known = wp_list_pluck( self::table_stats(), 'name' );
+		if ( ! in_array( $name, $known, true ) || ! self::can_drop( $name ) ) {
+			self::back( 'Ez a tábla nem törölhető innen.' );
+		}
+		$wpdb->query( 'DROP TABLE `' . str_replace( '`', '``', $name ) . '`' ); // phpcs:ignore WordPress.DB.PreparedSQL
+		self::back( $wpdb->last_error ? 'Hiba: ' . esc_html( $wpdb->last_error ) : 'Tábla törölve: <code>' . esc_html( $name ) . '</code>' );
 	}
 
 	public static function handle_noautoload() {
